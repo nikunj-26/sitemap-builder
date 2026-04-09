@@ -1,6 +1,6 @@
 # Sitemap Builder
 
-A fast, lightweight CLI tool to automatically generate XML sitemaps for your website. Built with Go, featuring a vibrant terminal UI and intelligent link crawling.
+A fast, lightweight CLI tool to automatically generate XML sitemaps for your website. Built with Go, featuring a vibrant terminal UI, concurrent crawling, and resilient link handling.
 
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
@@ -34,7 +34,7 @@ A fast, lightweight CLI tool to automatically generate XML sitemaps for your web
 
 ⚡ **Fast & Efficient**
 
-- Concurrent-friendly architecture
+- Concurrent worker-based crawler
 - Minimal memory footprint
 - Timing statistics for performance analysis
 
@@ -50,7 +50,7 @@ go build
 
 ### Requirements
 
-- Go 1.21 or higher
+- Go 1.25 or higher
 
 ## Usage
 
@@ -60,6 +60,12 @@ Generate a sitemap for a website:
 
 ```bash
 ./sitemap-builder -url=https://example.com
+```
+
+Or run directly without building:
+
+```bash
+go run . -url=https://example.com
 ```
 
 This creates a `sitemap.xml` file in the current directory.
@@ -72,16 +78,27 @@ Specify a custom filename for the sitemap:
 ./sitemap-builder -url=https://example.com -output=my-sitemap.xml
 ```
 
+### Custom Worker Count
+
+Control concurrency with worker count:
+
+```bash
+./sitemap-builder -url=https://example.com -workers=12
+```
+
 ### Command-Line Flags
 
-| Flag      | Description                                 | Default       |
-| --------- | ------------------------------------------- | ------------- |
-| `-url`    | The URL to build the sitemap for (required) | —             |
-| `-output` | Output filename for the sitemap             | `sitemap.xml` |
+| Flag       | Description                                 | Default            |
+| ---------- | ------------------------------------------- | ------------------ |
+| `-url`     | The URL to build the sitemap for (required) | —                  |
+| `-output`  | Output filename for the sitemap             | `sitemap.xml`      |
+| `-workers` | Number of concurrent workers                | `runtime.NumCPU()` |
 
 ## Example Output
 
 ```
+8 workers will be used for crawling.
+
 🕷️  Sitemap Builder
 Crawling: https://example.com
 
@@ -102,12 +119,12 @@ Crawling: https://example.com
 ## How It Works
 
 1. **Parse Input URL** - Validates and normalizes the base URL
-2. **Recursive Crawling** - Starting from the base URL, discovers all internal links
+2. **Concurrent Crawling** - Uses a worker-limited crawler to discover links in parallel
 3. **Link Extraction** - Parses HTML to find all anchor tags and links
 4. **URL Validation** - Checks if links are internal (same domain) and valid
-5. **Deduplication** - Skips already-visited URLs to prevent infinite loops
+5. **Deduplication** - Skips already-scheduled URLs to prevent duplicate work
 6. **Content Filtering** - Ignores non-HTML responses (PDFs, images, etc.)
-7. **Sitemap Generation** - Creates a properly formatted XML sitemap
+7. **Sitemap Generation** - Creates and sorts a properly formatted XML sitemap
 8. **Summary Report** - Displays crawl statistics and completion status
 
 ## Dependencies
@@ -130,7 +147,7 @@ All dependencies are managed via `go.mod` and will be automatically installed.
 Depends on site size and server speed. Typical sites (100-1000 pages) take 10-60 seconds.
 
 **Q: Can it crawl subdomains?**
-Only same-domain links are crawled. Cross-domain links are skipped.
+Only links with the same host are crawled. Cross-domain links are skipped.
 
 **Q: Does it handle JavaScript?**
 No, only static HTML is parsed. AJAX and dynamically rendered content won't be discovered.
