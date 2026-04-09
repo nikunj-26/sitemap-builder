@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"flag"
@@ -10,7 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -31,12 +35,17 @@ type URL struct {
 	Loc string `xml:"loc"`
 }
 
-var visited = make(map[string]bool)
-var crawlOrder []string // Track order of discovered URLs
-
-var BaseURL url.URL
-
 var ErrNonHTML = errors.New("non-html content")
+
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     20,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
 
 // Styling
 var (
@@ -53,20 +62,16 @@ func main() {
 	// Get inputs
 	baseURL := flag.String("url", "", "The URL to build the sitemap for")
 	output := flag.String("output", "sitemap.xml", "The name of the output sitemap file")
+	workers := flag.Int("workers", runtime.NumCPU(), "The number of concurrent workers to use")
 	flag.Parse()
+
+	fmt.Println()
+	fmt.Printf("%d workers will be used for crawling.", *workers)
 
 	if *baseURL == "" {
 		fmt.Println(style_error.Render("❌ Please provide a URL with -url flag"))
 		os.Exit(1)
 	}
-
-	// Setting as global variable for later use
-	parsedURL, err := url.Parse(*baseURL)
-	if err != nil {
-		fmt.Println(style_error.Render(fmt.Sprintf("❌ Error parsing URL: %v", err)))
-		os.Exit(1)
-	}
-	BaseURL = *parsedURL
 
 	// Print header
 	fmt.Println()
@@ -76,24 +81,24 @@ func main() {
 
 	startTime := time.Now()
 
-	err = buildSitemap(*baseURL)
+	c, err := buildSitemap(*baseURL, *workers)
 	if err != nil {
 		fmt.Println()
 		fmt.Println(style_error.Render(fmt.Sprintf("❌ Error: %v", err)))
 		os.Exit(1)
 	}
 
-	err = writeXML(*output)
+	err = c.writeXML(*output)
 	if err != nil {
 		fmt.Println(style_error.Render(fmt.Sprintf("❌ Error writing XML: %v", err)))
 		os.Exit(1)
 	}
 
 	duration := time.Since(startTime)
-	printSummary(duration, *output)
+	printSummary(duration, *output, c.visited)
 }
 
-func printSummary(duration time.Duration, filename string) {
+func printSummary(duration time.Duration, filename string, visited map[string]bool) {
 	fmt.Println()
 	fmt.Println(style_summary.Render("✅ Sitemap generated successfully!"))
 	fmt.Println()
@@ -103,48 +108,135 @@ func printSummary(duration time.Duration, filename string) {
 	fmt.Println()
 }
 
-func buildSitemap(url string) error {
-	if visited[url] {
-		return nil
+type crawler struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	sem       chan struct{}
+	wg        sync.WaitGroup
+	errOnce   sync.Once
+	firstErr  error
+	mu        sync.Mutex
+	scheduled map[string]bool
+	visited   map[string]bool
+	baseURL   url.URL
+}
+
+func newCrawler(workers int, baseURL url.URL) *crawler {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &crawler{
+		ctx:       ctx,
+		cancel:    cancel,
+		sem:       make(chan struct{}, workers),
+		scheduled: make(map[string]bool),
+		visited:   make(map[string]bool),
+		baseURL:   baseURL,
+	}
+}
+
+func (c *crawler) setErr(err error) {
+	c.errOnce.Do(func() {
+		c.firstErr = err
+		c.cancel()
+	})
+}
+
+func (c *crawler) isDone() bool {
+	select {
+	case <-c.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *crawler) enqueue(rawURL string) {
+	c.mu.Lock()
+	if c.scheduled[rawURL] {
+		c.mu.Unlock()
+		return
+	}
+	c.scheduled[rawURL] = true
+	c.mu.Unlock()
+
+	c.wg.Add(1)
+	go c.process(rawURL)
+}
+
+func (c *crawler) process(target string) {
+	defer c.wg.Done()
+
+	select {
+	case c.sem <- struct{}{}:
+		defer func() { <-c.sem }()
+	case <-c.ctx.Done():
+		return
 	}
 
-	fmt.Println(style_visiting.Render("🔗 Visiting: " + url))
+	fmt.Println(style_visiting.Render("🔗 Visiting: " + target))
 
-	r, err := getHTML(url)
+	r, err := getHTML(target)
 	if err != nil {
 		if errors.Is(err, ErrNonHTML) {
-			fmt.Println(style_skip.Render("⏭️  Skipping non-HTML: " + url))
-			return nil
+			fmt.Println(style_skip.Render("⏭️  Skipping non-HTML: " + target))
+			return
 		}
-		return fmt.Errorf("Error getting HTML for %s: %v", url, err)
+		c.setErr(fmt.Errorf("Error getting HTML for %s: %v", target, err))
+		return
 	}
 
-	// Mark as visited only after confirming this URL is HTML content.
-	visited[url] = true
-	crawlOrder = append(crawlOrder, url)
-
-	links, err := extractLinks(r)
+	links, err := c.extractLinks(r)
 	if err != nil {
-		return fmt.Errorf("Error extracting links for %s: %v", url, err)
+		c.setErr(fmt.Errorf("Error extracting links for %s: %v", target, err))
+		return
 	}
-	fmt.Println(style_success.Render(fmt.Sprintf("✓ Found %d links on: %s", len(links), url)))
+
+	c.mu.Lock()
+	c.visited[target] = true
+	c.mu.Unlock()
+
+	fmt.Println(style_success.Render(fmt.Sprintf("✓ Found %d links on: %s", len(links), target)))
+
+	if c.isDone() {
+		return
+	}
 
 	for _, link := range links {
-		err = buildSitemap(link.Href)
-		if err != nil {
-			return err
+		if c.isDone() {
+			return
 		}
+		c.enqueue(link.Href)
+	}
+}
+
+func buildSitemap(startURL string, workers int) (*crawler, error) {
+	if workers < 1 {
+		workers = 1
 	}
 
-	return nil
+	parsedURL, err := url.Parse(startURL)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing URL: %v", err)
+	}
+
+	c := newCrawler(workers, *parsedURL)
+	defer c.cancel()
+
+	c.enqueue(startURL)
+	c.wg.Wait()
+
+	return c, c.firstErr
 }
 
 func getHTML(url string) (io.Reader, error) {
-	res, err := http.Get(url)
+	res, err := httpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode > 299 {
+		return nil, fmt.Errorf("Response failed with status code: %d", res.StatusCode)
+	}
 
 	contentType := strings.ToLower(res.Header.Get("Content-Type"))
 	if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml+xml") {
@@ -152,17 +244,13 @@ func getHTML(url string) (io.Reader, error) {
 	}
 
 	body, err := io.ReadAll(res.Body)
-	if res.StatusCode > 299 {
-		return nil, fmt.Errorf("Response failed with status code: %d", res.StatusCode)
-	}
 	if err != nil {
 		return nil, err
 	}
-	// fmt.Printf("%s", body)
 	return bytes.NewReader(body), nil
 }
 
-func extractLinks(r io.Reader) ([]Link, error) {
+func (c *crawler) extractLinks(r io.Reader) ([]Link, error) {
 	var links []Link
 
 	doc, err := html.Parse(r)
@@ -181,13 +269,13 @@ func extractLinks(r io.Reader) ([]Link, error) {
 						continue
 					}
 
-					isInternal, err := isInternalLink(href)
+					isInternal, err := c.isInternalLink(href)
 					if err != nil {
 						continue
 					}
 					if isInternal {
 						// fmt.Println("Links", a.Val)
-						link.Href, err = normalizeURL(href)
+						link.Href, err = c.normalizeURL(href)
 						if err != nil {
 							continue
 						}
@@ -212,7 +300,7 @@ func sanitizeHref(link string) string {
 	return link
 }
 
-func isInternalLink(link string) (bool, error) {
+func (c *crawler) isInternalLink(link string) (bool, error) {
 	parsedLink, err := url.Parse(link)
 	if err != nil {
 		return false, fmt.Errorf("Error parsing URL %s: %v", link, err)
@@ -222,34 +310,38 @@ func isInternalLink(link string) (bool, error) {
 		return true, nil
 	}
 
-	return parsedLink.Host == BaseURL.Host, nil
+	return parsedLink.Host == c.baseURL.Host, nil
 }
 
-func normalizeURL(link string) (string, error) {
+func (c *crawler) normalizeURL(link string) (string, error) {
 	parsedLink, err := url.Parse(link)
 	if err != nil {
 		return "", fmt.Errorf("Error parsing URL %s: %v", link, err)
 	}
 
 	if parsedLink.IsAbs() == false {
-		return BaseURL.ResolveReference(parsedLink).String(), nil
+		return c.baseURL.ResolveReference(parsedLink).String(), nil
 	}
 
 	return parsedLink.String(), nil
 }
 
-func writeXML(filename string) error {
+func (c *crawler) writeXML(filename string) error {
 	urlSet := URLSet{
 		Xmlns: "http://www.sitemaps.org/schemas/sitemap/0.9",
 	}
 
-	for link := range visited {
+	for link := range c.visited {
 		urlSet.URLs = append(urlSet.URLs, URL{Loc: link})
 	}
 
+	sort.Slice(urlSet.URLs, func(i, j int) bool {
+		return urlSet.URLs[i].Loc < urlSet.URLs[j].Loc
+	})
+
 	file, err := os.Create(filename)
 	if err != nil {
-		return fmt.Errorf("Error creating sitemap file: %v", err)
+		return fmt.Errorf("error creating sitemap file: %v", err)
 	}
 	defer file.Close()
 
@@ -259,7 +351,7 @@ func writeXML(filename string) error {
 	encoder.Indent("", "  ")
 	err = encoder.Encode(urlSet)
 	if err != nil {
-		return fmt.Errorf("Error encoding sitemap: %v", err)
+		return fmt.Errorf("error encoding sitemap: %v", err)
 	}
 
 	return nil
