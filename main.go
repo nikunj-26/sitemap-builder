@@ -73,15 +73,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	normalizedStartURL, err := normalizeStartURL(*baseURL)
+	if err != nil {
+		fmt.Println(style_error.Render(fmt.Sprintf("❌ Invalid URL: %v", err)))
+		os.Exit(1)
+	}
+
 	// Print header
 	fmt.Println()
 	fmt.Println(style_header.Render("🕷️  Sitemap Builder"))
-	fmt.Println(style_stats.Render("Crawling: " + *baseURL))
+	fmt.Println(style_stats.Render("Crawling: " + normalizedStartURL))
 	fmt.Println()
 
 	startTime := time.Now()
 
-	c, err := buildSitemap(*baseURL, *workers)
+	c, err := buildSitemap(normalizedStartURL, *workers)
 	if err != nil {
 		fmt.Println()
 		fmt.Println(style_error.Render(fmt.Sprintf("❌ Error: %v", err)))
@@ -227,6 +233,42 @@ func buildSitemap(startURL string, workers int) (*crawler, error) {
 	return c, c.firstErr
 }
 
+func normalizeStartURL(rawURL string) (string, error) {
+	parsedURL, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", fmt.Errorf("error parsing URL: %v", err)
+	}
+
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return "", fmt.Errorf("unsupported URL scheme: %s", parsedURL.Scheme)
+	}
+
+	if parsedURL.Hostname() == "" {
+		return "", fmt.Errorf("missing URL host")
+	}
+
+	parsedURL.Path = "/"
+	parsedURL.RawPath = ""
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+
+	if parsedURL.Scheme == "http" {
+		res, err := httpClient.Get(parsedURL.String())
+		if err == nil {
+			res.Body.Close()
+			if res.Request != nil && res.Request.URL != nil {
+				finalURL := res.Request.URL
+				if finalURL.Scheme == "https" && finalURL.Hostname() == parsedURL.Hostname() {
+					parsedURL.Scheme = "https"
+					parsedURL.Host = finalURL.Host
+				}
+			}
+		}
+	}
+
+	return parsedURL.String(), nil
+}
+
 func getHTML(url string) (io.Reader, error) {
 	res, err := httpClient.Get(url)
 	if err != nil {
@@ -306,11 +348,15 @@ func (c *crawler) isInternalLink(link string) (bool, error) {
 		return false, fmt.Errorf("Error parsing URL %s: %v", link, err)
 	}
 
-	if parsedLink.IsAbs() == false {
+	if parsedLink.Scheme != "" && parsedLink.Scheme != "http" && parsedLink.Scheme != "https" {
+		return false, nil
+	}
+
+	if parsedLink.Host == "" {
 		return true, nil
 	}
 
-	return parsedLink.Host == c.baseURL.Host, nil
+	return parsedLink.Hostname() == c.baseURL.Hostname(), nil
 }
 
 func (c *crawler) normalizeURL(link string) (string, error) {
