@@ -131,6 +131,7 @@ Crawling: https://example.com
 
 - `golang.org/x/net/html` - HTML parsing
 - `github.com/charmbracelet/lipgloss` - Terminal styling
+- gator
 
 All dependencies are managed via `go.mod` and will be automatically installed.
 
